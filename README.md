@@ -49,5 +49,5 @@ console.log('AuditLog:', { event: '...', at: new Date().toISOString(), ... })
 
 ## CI and deployment
 
-CI runs on every push and pull request. A successful push to `main`, including a pull request merge, calls the production deployment workflow. Configure a GitHub environment named `production` and restrict it to `main`. Set `DO_SSH_FINGERPRINT` to the verified SHA256 fingerprint of the deployment host's SSH key; the deployment fails closed if this or another required deployment setting is missing. The workflow copies built files to `/opt/evzone/admin/site`, which the shared Caddy proxy serves at `portal01.evzoneride.com`.
+CI runs on every push and pull request. A successful push to `main`, including a pull request merge, calls the production deployment workflow. Configure a GitHub environment named `production` and restrict it to `main`. Set `DO_SSH_KNOWN_HOSTS` to the verified host key entry and `DO_SSH_FINGERPRINT` to its SHA256 fingerprint; the deployment fails closed if either is missing or mismatched. The workflow atomically activates built files under `/opt/evzone/admin/site`, which the shared Caddy proxy serves at `portal01.evzoneride.com`.
 
