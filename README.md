@@ -47,3 +47,7 @@ console.log('AuditLog:', { event: '...', at: new Date().toISOString(), ... })
 - Some attached pages include their own local theme toggles. They still work, but the
   recommended next step is to centralize page theming onto the global provider.
 
+## CI and deployment
+
+CI runs on every push and pull request. A successful push to `main`, including a pull request merge, calls the production deployment workflow. Configure a GitHub environment named `production` and restrict it to `main`. Set `DO_SSH_KNOWN_HOSTS` to the verified host key entry and `DO_SSH_FINGERPRINT` to its SHA256 fingerprint; the deployment fails closed if either is missing or mismatched. The workflow atomically activates built files under `/opt/evzone/admin/site`, which the shared Caddy proxy serves at `portal01.evzoneride.com`.
+

@@ -1,20 +1,10 @@
 name: Deploy (Admin Web)
 
 on:
-  push:
-    branches: [main, master]
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Target environment'
-        required: false
-        default: 'production'
+  workflow_call:
 
 concurrency:
-  group: deploy-admin-${{ github.ref }}
+  group: deploy-admin-production
   cancel-in-progress: false
 
 permissions:
@@ -23,17 +13,58 @@ permissions:
 env:
   DEPLOY_DIR: /opt/evzone/admin
   APP_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
-  WEB_ROOT: /var/www
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
+    environment: production
     steps:
+      - name: Verify deployment settings
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          API_DOMAIN: ${{ vars.APP_DOMAIN }}
+          APP_DOMAIN: ${{ vars.ADMIN_DOMAIN }}
+          DEPLOY_KEY: ${{ secrets.DO_SSH_KEY }}
+          SSH_FINGERPRINT: ${{ secrets.DO_SSH_FINGERPRINT }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DO_SSH_KNOWN_HOSTS }}
+        run: |
+          for name in DEPLOY_HOST API_DOMAIN APP_DOMAIN DEPLOY_KEY SSH_FINGERPRINT SSH_KNOWN_HOSTS; do
+            if [ -z "${!name}" ]; then echo "Missing deployment setting: $name" >&2; exit 1; fi
+          done
+
+      - name: Configure verified SSH
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_KEY: ${{ secrets.DO_SSH_KEY }}
+          SSH_FINGERPRINT: ${{ secrets.DO_SSH_FINGERPRINT }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DO_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          actual="$(ssh-keygen -F "$DEPLOY_HOST" -f ~/.ssh/known_hosts | sed '/^#/d' | ssh-keygen -lf - | awk 'NR==1{print $2}')"
+          test "$actual" = "$SSH_FINGERPRINT"
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Verify this is the current main commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$latest" != "$GITHUB_SHA" ]; then
+            echo "Main has advanced since this CI run; skipping stale deployment" >&2
+            exit 1
+          fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22'
           cache: npm
@@ -49,52 +80,27 @@ jobs:
           VITE_SOCKET_BASE_URL: wss://${{ vars.APP_DOMAIN }}
           VITE_GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
 
-      - name: Upload build & deploy artifacts
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ vars.DEPLOY_HOST }}
-          username: ${{ env.APP_USER }}
-          key: ${{ secrets.DO_SSH_KEY }}
-          source: "dist,deploy"
-          target: ${{ env.DEPLOY_DIR }}
-          rm: true
-          overwrite: true
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Run remote deployment
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ vars.DEPLOY_HOST }}
-          username: ${{ env.APP_USER }}
-          key: ${{ secrets.DO_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            DEPLOY_DIR="${{ env.DEPLOY_DIR }}"
-            WEB_ROOT="${{ env.WEB_ROOT }}"
-            ADMIN_DOMAIN="${{ vars.ADMIN_DOMAIN }}"
-            DOMAIN="$ADMIN_DOMAIN"
-            SSL_EMAIL="${{ secrets.SSL_EMAIL }}"
-
-            echo "==> One-time server setup (idempotent)"
-            sudo bash "$DEPLOY_DIR/deploy/setup-server.sh"
-
-            echo "==> Install static site"
-            sudo rm -rf "$WEB_ROOT/$DOMAIN/html"
-            sudo mkdir -p "$WEB_ROOT/$DOMAIN/html"
-            sudo cp -r "$DEPLOY_DIR/dist/." "$WEB_ROOT/$DOMAIN/html/"
-
-            echo "==> Install nginx site config"
-            sudo cp "$DEPLOY_DIR/deploy/nginx/admin.conf" "/etc/nginx/sites-available/$DOMAIN"
-            sudo sed -i "s/__DOMAIN__/$DOMAIN/g" "/etc/nginx/sites-available/$DOMAIN"
-            sudo ln -sf "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
-            sudo rm -f /etc/nginx/sites-enabled/default
-            sudo nginx -t
-            sudo systemctl reload nginx
-
-            echo "==> Provision TLS certificate (Certbot)"
-            sudo bash "$DEPLOY_DIR/deploy/setup-ssl.sh" "$DOMAIN" "$SSL_EMAIL"
-
-            echo "==> Admin web deploy complete for $DOMAIN"
+      - name: Upload and activate static release
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$APP_USER@$DEPLOY_HOST" \
+            "rm -rf '$DEPLOY_DIR/release' && mkdir -p '$DEPLOY_DIR/release'"
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes -r dist \
+            "$APP_USER@$DEPLOY_HOST:$DEPLOY_DIR/release/"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes "$APP_USER@$DEPLOY_HOST" \
+            sh -s -- "$DEPLOY_DIR" "$GITHUB_SHA" <<'REMOTE'
+          set -eu
+          DEPLOY_DIR="$1"
+          RELEASE_SHA="$2"
+          SITE_DIR="$DEPLOY_DIR/site"
+          RELEASE_DIR="$SITE_DIR/releases/$RELEASE_SHA"
+          test -s "$DEPLOY_DIR/release/dist/index.html"
+          mkdir -p "$RELEASE_DIR"
+          cp -a "$DEPLOY_DIR/release/dist/." "$RELEASE_DIR/"
+          test -s "$RELEASE_DIR/index.html"
+          ln -sfn "releases/$RELEASE_SHA" "$SITE_DIR/.current-next"
+          mv -Tf "$SITE_DIR/.current-next" "$SITE_DIR/current"
+          REMOTE
